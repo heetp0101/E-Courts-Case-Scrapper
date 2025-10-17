@@ -6,4 +6,7 @@
 
 - Run the git clone command
   ```
-  git clone 
+  git clone https://github.com/heetp0101/E-Courts-Case-Scrapper.git
+  ```
+
+### Step 2 : Create Virtual Environment
