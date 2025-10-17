@@ -475,6 +475,13 @@ def get_court_names():
         option_elements = soup.find_all('option')
         
         for option in option_elements:
+            
+            
+            # Skip disabled options
+            if option.has_attr('disabled'):
+                continue
+
+
             value = option.get('value')
             text = option.get_text(strip=True)
             
