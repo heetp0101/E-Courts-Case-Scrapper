@@ -1,0 +1,1073 @@
+# app.py
+from flask import Flask, request, jsonify, render_template
+import requests
+from bs4 import BeautifulSoup
+import json
+import re
+import io
+import base64
+import time
+import random
+import uuid
+import time
+
+app = Flask(__name__)
+
+# Base URL for the eCourts service
+BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
+
+# Store session to maintain cookies
+session = requests.Session()
+
+# Try to import pytesseract, but handle if not available
+# try:
+#     import pytesseract
+#     from PIL import Image
+#     TESSERACT_AVAILABLE = True
+#     # For Windows users - uncomment and adjust path if needed:
+#     # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
+# except ImportError:
+#     TESSERACT_AVAILABLE = False
+#     print("Warning: pytesseract or PIL not available. Captcha OCR will not work.")
+
+
+# Store sessions by unique ID
+sessions = {}
+
+def get_or_create_session(session_id):
+    """Get existing session or create new one with proper browser headers"""
+    if session_id not in sessions:
+        session = requests.Session()
+        
+        # Set proper browser-like headers
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Connection': 'keep-alive',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Cache-Control': 'max-age=0',
+        })
+        
+        sessions[session_id] = session
+    return sessions[session_id]
+
+def make_robust_request(session, url, max_retries=3, delay=2):
+    """Make a request with retries and delays to avoid being blocked"""
+    for attempt in range(max_retries):
+        try:
+            print(f"Attempt {attempt + 1} to fetch: {url}")
+            response = session.get(url, timeout=30)
+            
+            if response.status_code == 200:
+                return response
+            else:
+                print(f"Request failed with status {response.status_code}")
+                
+        except requests.exceptions.RequestException as e:
+            print(f"Request error (attempt {attempt + 1}): {e}")
+            
+        if attempt < max_retries - 1:
+            print(f"Waiting {delay} seconds before retry...")
+            time.sleep(delay)
+    
+    return None
+
+def extract_captcha_token(html_content):
+    """Extract the actual captcha token from the main page HTML"""
+    try:
+        # Look for the pattern in the HTML
+        patterns = [
+            r'securimage_show\.php\?([a-f0-9]{32})',
+            r'captcha.*?([a-f0-9]{32})',
+            r'refreshCaptcha.*?([a-f0-9]{32})'
+        ]
+        
+        for pattern in patterns:
+            matches = re.findall(pattern, html_content, re.IGNORECASE)
+            if matches:
+                print(f"Found captcha token using pattern '{pattern}': {matches[0]}")
+                return matches[0]
+        
+        # Also check for img tags
+        soup = BeautifulSoup(html_content, 'html.parser')
+        img_tags = soup.find_all('img', src=True)
+        for img in img_tags:
+            if 'securimage_show.php' in img['src']:
+                match = re.search(r'securimage_show\.php\?([a-f0-9]+)', img['src'])
+                if match:
+                    print(f"Found captcha token in img tag: {match.group(1)}")
+                    return match.group(1)
+        
+        print("No captcha token found in HTML")
+        return None
+        
+    except Exception as e:
+        print(f"Error extracting captcha token: {e}")
+        return None
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# Simple health check
+@app.route('/api/health', methods=['GET'])
+def health_check():
+    return jsonify({'status': 'healthy', 'message': 'Server is running'})
+
+# Initialize session and get captcha with proper error handling
+@app.route('/api/init-session', methods=['GET'])
+def init_session():
+    try:
+        session_id = str(uuid.uuid4())
+        session = get_or_create_session(session_id)
+        
+        print("Step 1: Loading main page to establish session...")
+        
+        # First, make a simple request to establish session
+        main_page_url = f"{BASE_URL}?p=cause_list/"
+        main_page_response = make_robust_request(session, main_page_url)
+        
+        if not main_page_response:
+            return jsonify({
+                'error': 'Failed to establish connection with eCourts server. The server may be down or blocking requests.',
+                'success': False
+            }), 503
+        
+        print(f"Main page loaded successfully. Status: {main_page_response.status_code}")
+        
+        # Try to extract captcha token
+        captcha_token = extract_captcha_token(main_page_response.text)
+        
+        # Build captcha URL
+        if captcha_token:
+            captcha_url = f"{BASE_URL}vendor/securimage/securimage_show.php?{captcha_token}"
+        else:
+            # Fallback: try without token (session-based)
+            captcha_url = f"{BASE_URL}vendor/securimage/securimage_show.php"
+            print("Using session-based captcha (no token found)")
+        
+        print(f"Step 2: Fetching captcha from: {captcha_url}")
+        
+        # Fetch captcha image
+        captcha_response = make_robust_request(session, captcha_url)
+        
+        if not captcha_response or captcha_response.status_code != 200:
+            print("Failed to fetch captcha, trying alternative approach...")
+            
+            # Alternative: Try to get states first to verify session works
+            states_response = session.get(f"{BASE_URL}?p=cause_list/")
+            if states_response.status_code == 200:
+                return jsonify({
+                    'session_id': session_id,
+                    'captcha_image': None,
+                    'message': 'Session established but captcha failed. Please try refreshing.',
+                    'success': True
+                })
+            else:
+                return jsonify({
+                    'error': 'Cannot establish connection with eCourts server. Please try again later.',
+                    'success': False
+                }), 503
+        
+        # Convert image to base64
+        img_str = base64.b64encode(captcha_response.content).decode()
+        
+        # Store session info
+        session.captcha_token = captcha_token
+        session.last_activity = time.time()
+        
+        return jsonify({
+            'session_id': session_id,
+            'captcha_image': f"data:image/png;base64,{img_str}",
+            'captcha_token': captcha_token,
+            'success': True
+        })
+        
+    except Exception as e:
+        print(f"Error in init_session: {str(e)}")
+        return jsonify({
+            'error': f'Internal server error: {str(e)}',
+            'success': False
+        }), 500
+
+# Get captcha for existing session
+@app.route('/api/captcha', methods=['POST'])
+def get_captcha():
+    try:
+        session_id = request.json.get('session_id')
+        if not session_id or session_id not in sessions:
+            return jsonify({'error': 'Invalid session', 'success': False}), 400
+        
+        session = sessions[session_id]
+        
+        # Use stored token or get new one
+        captcha_token = getattr(session, 'captcha_token', None)
+        
+        if captcha_token:
+            captcha_url = f"{BASE_URL}vendor/securimage/securimage_show.php?{captcha_token}"
+        else:
+            # Get fresh token
+            main_response = make_robust_request(session, f"{BASE_URL}?p=cause_list/")
+            if main_response:
+                captcha_token = extract_captcha_token(main_response.text)
+                if captcha_token:
+                    captcha_url = f"{BASE_URL}vendor/securimage/securimage_show.php?{captcha_token}"
+                    session.captcha_token = captcha_token
+                else:
+                    captcha_url = f"{BASE_URL}vendor/securimage/securimage_show.php"
+            else:
+                return jsonify({'error': 'Cannot connect to server', 'success': False}), 503
+        
+        print(f"Fetching captcha from: {captcha_url}")
+        
+        captcha_response = make_robust_request(session, captcha_url)
+        
+        if captcha_response and captcha_response.status_code == 200:
+            img_str = base64.b64encode(captcha_response.content).decode()
+            
+            return jsonify({
+                'captcha_image': f"data:image/png;base64,{img_str}",
+                'success': True
+            })
+        else:
+            return jsonify({'error': 'Failed to fetch captcha image', 'success': False}), 500
+            
+    except Exception as e:
+        print(f"Error in get_captcha: {str(e)}")
+        return jsonify({'error': str(e), 'success': False}), 500
+
+
+# Get States
+@app.route('/api/states', methods=['GET'])
+def get_states():
+    try:
+        # Get the main cause list page
+        response = requests.get(f"{BASE_URL}?p=cause_list/")
+        
+        # Check if request was successful
+        if response.status_code != 200:
+            return jsonify({'error': f'Failed to fetch data. Status code: {response.status_code}'}), 500
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find the state dropdown using the exact ID from the HTML snippet
+        state_select = soup.find('select', {'id': 'sess_state_code'})
+        
+        states = []
+        if state_select:
+            print(f"Found state dropdown with {len(state_select.find_all('option'))} options")
+            for option in state_select.find_all('option'):
+                value = option.get('value')
+                text = option.text.strip()
+                # Skip the placeholder option (value '0')
+                if value and value != '0' and text and text.lower() != 'select state':
+                    states.append({
+                        'code': value,
+                        'name': text
+                    })
+            print(f"Extracted {len(states)} states")
+        else:
+            print("State dropdown not found with id 'sess_state_code'")
+        
+        return jsonify({'states': states})
+    
+    except Exception as e:
+        print(f"Error in get_states: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+# Get Districts based on State
+@app.route('/api/districts', methods=['POST'])
+def get_districts():
+    try:
+        session_id = request.json.get('session_id')
+        state_code = request.json.get('state_code')
+        print(f"Fetching districts for state code: {state_code}")
+        
+
+        # If session_id is provided, use that session, otherwise create a new one
+        if session_id and session_id in sessions:
+            session = sessions[session_id]
+            print(f"Using existing session: {session_id}")
+        else:
+            session = requests.Session()
+            print("Using new session for districts")
+
+
+
+        # Use the exact endpoint and form data structure you discovered
+        url = f"{BASE_URL}?p=casestatus/fillDistrict"
+        
+        form_data = {
+
+            'state_code': state_code,
+            'ajax_req': 'true',
+            'app_token': '6d0d7af522b4a85486f5f22ff972dbb2beb8a3221744493f406deeda3dda8372'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        response = requests.post(url, data=form_data, headers=headers)
+        print(f"District API response status: {response.status_code}")
+        print(f"Raw response text: {response.text[:500]}...")  # Print first 500 chars for debugging
+        
+        # Fix the escaped HTML tags before parsing
+        cleaned_html = response.text.replace('<\/', '</')
+        
+        # Parse the cleaned HTML
+        soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+        # Extract district options
+        districts = []
+        option_elements = soup.find_all('option')
+        
+        for option in option_elements:
+            value = option.get('value')
+            text = option.get_text(strip=True)
+            
+            # Skip the placeholder option and empty values
+            if value and value != '' and text and text.lower() != 'select district':
+                districts.append({
+                    'code': value,
+                    'name': text
+                })
+        
+        print(f"Extracted {len(districts)} districts: {[d['name'] for d in districts]}")
+        return jsonify({'districts': districts})
+    
+    except Exception as e:
+        print(f"Error in get_districts: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+
+# Get Courts based on District
+@app.route('/api/courts', methods=['POST'])
+def get_courts():
+    try:
+        session_id = request.json.get('session_id')
+        state_code = request.json.get('state_code')
+        dist_code = request.json.get('dist_code')
+        print(f"Fetching courts for state: {state_code}, district: {dist_code}")
+        
+
+
+        # If session_id is provided, use that session, otherwise create a new one
+        if session_id and session_id in sessions:
+            session = sessions[session_id]
+            print(f"Using existing session: {session_id}")
+        else:
+            session = requests.Session()
+            print("Using new session for districts")
+
+
+        # Use the correct endpoint for courts
+        url = f"{BASE_URL}?p=casestatus/fillcomplex"
+        
+        form_data = {
+            'state_code': state_code,
+            'dist_code': dist_code,  # Note: using 'district_code' instead of 'dist_code'
+            'ajax_req': 'true',
+            'app_token': '2f4d7e7c37a9de46f436d02027e20e098961ed84de12b1b93fabdb6398a34e7a'  # Using the new app_token you provided
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        response = requests.post(url, data=form_data, headers=headers)
+        print(f"Court API response status: {response.status_code}")
+        print(f"Raw court response: {response.text[:500]}...")
+        
+        # Fix the escaped HTML tags before parsing
+        cleaned_html = response.text.replace('<\/', '</')
+        
+        # Parse the cleaned HTML
+        soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+        # Extract court options
+        courts = []
+        option_elements = soup.find_all('option')
+        
+        for option in option_elements:
+            value = option.get('value')
+            text = option.get_text(strip=True)
+            
+            # Skip the placeholder option and empty values
+            if value and value != '' and text and text.lower() != 'select court' and text.strip():
+                courts.append({
+                    'code': value,
+                    'name': text
+                })
+        
+        print(f"Extracted {len(courts)} courts: {[c['name'] for c in courts]}")
+        return jsonify({'courts': courts})
+    
+    except Exception as e:
+        print(f"Error in get_courts: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+# Get Court Names based on Court Complex
+@app.route('/api/court-names', methods=['POST'])
+def get_court_names():
+    try:
+        state_code = request.json.get('state_code')
+        dist_code = request.json.get('dist_code')
+        court_complex_code = request.json.get('court_complex_code')
+        
+        print(f"Fetching court names for state: {state_code}, district: {dist_code}, court complex: {court_complex_code}")
+        
+        # Extract est_code from court_complex_code (format: 1170157@8@N)
+        est_code = None
+        if '@' in court_complex_code:
+            parts = court_complex_code.split('@')
+            if len(parts) >= 2:
+                est_code = parts[1]
+                court_complex_code = parts[0]
+        
+        # Use the endpoint for court names
+        url = f"{BASE_URL}?p=cause_list/fillCauseList"
+        
+        form_data = {
+            'state_code': state_code,
+            'dist_code': dist_code,
+            'court_complex_code': court_complex_code,
+            'est_code': est_code,
+            'search_act': 'undefined',
+            'ajax_req': 'true',
+            'app_token': '1c41526026f1a4c9c63a051bfcab2b4a9d18d392c26d868f42fb5eade8fb688f'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        response = requests.post(url, data=form_data, headers=headers)
+        print(f"Court Names API response status: {response.status_code}")
+        print(f"Raw court names response: {response.text[:500]}...")
+        
+        # Fix the escaped HTML tags before parsing
+        cleaned_html = response.text.replace('<\/', '</')
+        
+        # Parse the cleaned HTML
+        soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+        # Extract court name options
+        court_names = []
+        option_elements = soup.find_all('option')
+        
+        for option in option_elements:
+            value = option.get('value')
+            text = option.get_text(strip=True)
+            
+            # Skip the placeholder option and empty values
+            if value and value != '' and text and text.lower() != 'select court name' and text.strip():
+                court_names.append({
+                    'code': value,
+                    'name': text
+                })
+        
+        print(f"Extracted {len(court_names)} court names: {[cn['name'] for cn in court_names]}")
+        return jsonify({'court_names': court_names})
+    
+    except Exception as e:
+        print(f"Error in get_court_names: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# Get Captcha Image
+# @app.route('/api/captcha', methods=['GET'])
+# def get_captcha():
+#     try:
+#         # Generate a random parameter for the captcha URL
+#         random_param = ''.join(random.choices('abcdef0123456789', k=32))
+#         captcha_url = f"{BASE_URL}vendor/securimage/securimage_show.php"
+        
+#         print(f"Fetching captcha from: {captcha_url}")
+        
+#         # Get the captcha image with proper headers
+#         headers = {
+#             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+#             'Accept': 'image/webp,image/apng,image/*,*/*;q=0.8',
+#             'Accept-Language': 'en-US,en;q=0.9',
+#             'Referer': f'{BASE_URL}?p=cause_list/'
+#         }
+        
+#         response = session.get(captcha_url, headers=headers)
+        
+#         if response.status_code == 200:
+#             # Convert image to base64 for frontend display
+#             img_str = base64.b64encode(response.content).decode()
+            
+#             captcha_text = ""
+#             status_message = "Captcha loaded - manual input required"
+            
+#             # Try OCR if available
+#             if TESSERACT_AVAILABLE:
+#                 try:
+#                     image = Image.open(io.BytesIO(response.content))
+#                     image = image.convert('L')  # Convert to grayscale
+#                     image = image.point(lambda x: 0 if x < 128 else 255)  # Increase contrast
+                    
+#                     # Use pytesseract to read captcha
+#                     captcha_text = pytesseract.image_to_string(image, config='--psm 8 -c tessedit_char_whitelist=abcdefghijklmnopqrstuvwxyz0123456789')
+#                     captcha_text = captcha_text.strip()
+                    
+#                     if captcha_text:
+#                         status_message = f"Captcha auto-detected: {captcha_text}"
+#                     else:
+#                         status_message = "Could not read captcha automatically"
+                        
+#                     print(f"Captcha recognized: '{captcha_text}'")
+                    
+#                 except Exception as ocr_error:
+#                     print(f"OCR error: {ocr_error}")
+#                     status_message = "OCR failed - manual input required"
+#             else:
+#                 status_message = "OCR not available - please enter captcha manually"
+            
+#             return jsonify({
+#                 'captcha_text': captcha_text,
+#                 'captcha_image': f"data:image/png;base64,{img_str}",
+#                 'status_message': status_message,
+#                 'ocr_available': TESSERACT_AVAILABLE,
+#                 'success': True
+#             })
+#         else:
+#             print(f"Failed to fetch captcha. Status: {response.status_code}")
+#             return jsonify({
+#                 'error': 'Failed to fetch captcha image', 
+#                 'success': False
+#             }), 500
+            
+#     except Exception as e:
+#         print(f"Error in get_captcha: {str(e)}")
+#         return jsonify({
+#             'error': str(e), 
+#             'success': False
+#         }), 500
+
+# Get Cause List with Manual Captcha Fallback
+# Get Cause List with session consistency
+
+# @app.route('/api/cause-list', methods=['POST'])
+# def get_cause_list():
+#     try:
+#         session_id = request.json.get('session_id')
+#         state_code = request.json.get('state_code')
+#         dist_code = request.json.get('dist_code')
+#         court_code = request.json.get('court_code')
+#         court_name_code = request.json.get('court_name_code')
+#         date = request.json.get('date')
+#         captcha_text = request.json.get('captcha')
+        
+
+#         est_code = None
+#         if '@' in court_code:
+#             parts = court_code.split('@')
+#             if len(parts) >= 2:
+#                 est_code = parts[1]
+#                 court_code = parts[0]
+
+
+#         print(f"=== CAUSE LIST REQUEST DEBUG ===")
+#         print(f"Session ID: {session_id}")
+#         print(f"State Code: {state_code}")
+#         print(f"District Code: {dist_code}")
+#         print(f"Court Code: {court_code}")
+#         print(f"Court Name Code: {court_name_code}")
+#         print(f"Date: {date}")
+#         print(f"Captcha: {captcha_text}")
+        
+#         if not captcha_text:
+#             return jsonify({'error': 'Captcha is required'}), 400
+        
+#         # Use session if available, otherwise create new
+#         if session_id and session_id in sessions:
+#             session = sessions[session_id]
+#             print("Using existing session")
+#         else:
+#             session = requests.Session()
+#             print("Using new session")
+#             # Set headers for new session
+#             session.headers.update({
+#                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+#             })
+        
+#         # Convert date format
+#         date_parts = date.split('-')
+#         if len(date_parts) == 3:
+#             formatted_date = f"{date_parts[2]}-{date_parts[1]}-{date_parts[0]}"
+#         else:
+#             formatted_date = date
+        
+#         print(f"Formatted date: {formatted_date}")
+        
+#         # Submit cause list request
+#         url = f"{BASE_URL}?p=cause_list/submitCauseList"
+        
+#         # Debug: Print the court_name_code to see what we're sending
+#         print(f"Court Name Code being sent: {court_name_code}")
+        
+#         form_data = {
+#             'CL_court_no': court_name_code,
+#             'causelist_date': formatted_date,
+#             'cause_list_captcha_code': captcha_text,
+#             'court_name_txt': '',
+#             'state_code': state_code,
+#             'dist_code': dist_code,
+#             'court_complex_code': court_code,
+#             'est_code': 'null',
+#             'cicri': 'civ',
+#             'selprevdays': '0',
+#             'ajax_req': 'true',
+#             'app_token': 'e8fe4f2cc4cc9baaff51327f63192ae727c66ba541b868164d2763b70dc37489'
+#         }
+        
+#         print(f"Form data being sent: {form_data}")
+        
+#         headers = {
+#             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+#             'Content-Type': 'application/x-www-form-urlencoded',
+#             'X-Requested-With': 'XMLHttpRequest',
+#             'Referer': f'{BASE_URL}?p=cause_list/'
+#         }
+        
+#         print(f"Sending POST request to: {url}")
+#         response = session.post(url, data=form_data, headers=headers)
+#         print(f"Response status: {response.status_code}")
+#         print(f"Response headers: {dict(response.headers)}")
+        
+#         # Save the raw response for debugging
+#         with open('debug_response.html', 'w', encoding='utf-8') as f:
+#             f.write(response.text)
+#         print("Raw response saved to debug_response.html")
+        
+#         # Check for common errors in response
+#         response_lower = response.text.lower()
+        
+#         if 'invalid security code' in response_lower:
+#             print("ERROR: Invalid captcha detected")
+#             return jsonify({'error': 'Invalid captcha, please try again'}), 400
+        
+#         if 'session expired' in response_lower or 'invalid session' in response_lower:
+#             print("ERROR: Session expired")
+#             return jsonify({'error': 'Session expired, please refresh the page'}), 400
+        
+#         if 'no case' in response_lower or 'not found' in response_lower or 'no data' in response_lower:
+#             print("INFO: Server explicitly says no cases found")
+#             return jsonify({'cause_list': [], 'message': 'No cases found for the selected criteria'})
+        
+#         if 'error' in response_lower:
+#             print(f"ERROR: Server returned error: {response.text[:200]}")
+#             return jsonify({'error': 'Server returned an error response'}), 400
+        
+#         # Parse the response
+#         cleaned_html = response.text.replace('\/', '/')
+#         soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+#         # Look for the cause list table
+#         cause_list_table = soup.find('table', {'id': 'dispTable'})
+        
+#         if not cause_list_table:
+#             print("WARNING: No dispTable found in response")
+#             # Try to find any table that might contain the data
+#             all_tables = soup.find_all('table')
+#             print(f"Found {len(all_tables)} tables total")
+#             for i, table in enumerate(all_tables):
+#                 print(f"Table {i}: {len(table.find_all('tr'))} rows")
+            
+#             # Check if there's a message about no cases
+#             if 'no case' in response.text.lower() or 'not found' in response.text.lower():
+#                 return jsonify({'cause_list': [], 'message': 'No cases found'})
+#             else:
+#                 return jsonify({'error': 'No case data table found in server response'}), 400
+        
+#         print(f"Found dispTable with {len(cause_list_table.find_all('tr'))} rows")
+        
+#         cause_list = []
+#         rows = cause_list_table.find_all('tr')
+#         current_case_type = ""
+        
+#         for i, row in enumerate(rows):
+#             # Skip header rows
+#             if row.find('th'):
+#                 continue
+            
+#             # Check for case type header
+#             case_type_td = row.find('td', {'colspan': '6'})
+#             if case_type_td and 'color:#3880d4' in str(case_type_td.get('style', '')):
+#                 current_case_type = case_type_td.get_text(strip=True)
+#                 print(f"Found case type: {current_case_type}")
+#                 continue
+            
+#             # Skip label rows
+#             if row.find('td', {'id': 'case_type_lable'}):
+#                 continue
+            
+#             # Process data rows
+#             cols = row.find_all('td')
+#             if len(cols) == 4:
+#                 sr_no_text = cols[0].get_text(strip=True)
+#                 if sr_no_text and sr_no_text.isdigit():
+#                     # Process case cell
+#                     case_cell = cols[1]
+#                     for a_tag in case_cell.find_all('a'):
+#                         a_tag.decompose()
+#                     case_details = case_cell.get_text(separator='\n', strip=True)
+                    
+#                     # Process party names
+#                     party_names = cols[2].get_text(separator='\n', strip=True)
+                    
+#                     # Process advocates
+#                     advocates = cols[3].get_text(separator='\n', strip=True)
+                    
+#                     cause_list.append({
+#                         'sr_no': int(sr_no_text),
+#                         'case_type': current_case_type,
+#                         'case_details': case_details,
+#                         'party_name': party_names,
+#                         'advocate': advocates
+#                     })
+#                     print(f"Added case {sr_no_text}: {case_details[:50]}...")
+        
+#         print(f"=== PARSING COMPLETE ===")
+#         print(f"Extracted {len(cause_list)} cases")
+        
+#         if len(cause_list) == 0:
+#             print("No cases were parsed from the table")
+#             # Check if the table has any content at all
+#             if len(rows) <= 2:  # Only headers and maybe one empty row
+#                 return jsonify({'cause_list': [], 'message': 'No cases listed for the selected date and court'})
+#             else:
+#                 return jsonify({'error': 'Could not parse case data from table'}), 400
+        
+#         return jsonify({'cause_list': cause_list})
+    
+#     except Exception as e:
+#         print(f"Error in get_cause_list: {str(e)}")
+#         import traceback
+#         print(f"Traceback: {traceback.format_exc()}")
+#         return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+    
+
+
+
+# Get Cause List - Fixed to properly handle JSON response
+@app.route('/api/cause-list', methods=['POST'])
+def get_cause_list():
+    try:
+        session_id = request.json.get('session_id')
+        state_code = request.json.get('state_code')
+        dist_code = request.json.get('dist_code')
+        court_code = request.json.get('court_code')
+        court_name_code = request.json.get('court_name_code')
+        date = request.json.get('date')
+        captcha_text = request.json.get('captcha')
+
+
+        if '@' in court_code:
+            parts = court_code.split('@')
+            if len(parts) >= 2:
+                court_code = parts[0]
+
+
+
+
+        print(f"=== CAUSE LIST REQUEST DEBUG ===")
+        print(f"Session ID: {session_id}")
+        print(f"State Code: {state_code}")
+        print(f"District Code: {dist_code}")
+        print(f"Court Code: {court_code}")
+        print(f"Court Name Code: {court_name_code}")
+        print(f"Date: {date}")
+        print(f"Captcha: {captcha_text}")
+        
+        if not captcha_text:
+            return jsonify({'error': 'Captcha is required'}), 400
+        
+        # Use session if available, otherwise create new
+        if session_id and session_id in sessions:
+            session = sessions[session_id]
+            print("Using existing session")
+        else:
+            session = requests.Session()
+            print("Using new session")
+            session.headers.update({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            })
+        
+        # Convert date format
+        date_parts = date.split('-')
+        if len(date_parts) == 3:
+            formatted_date = f"{date_parts[2]}-{date_parts[1]}-{date_parts[0]}"
+        else:
+            formatted_date = date
+        
+        print(f"Formatted date: {formatted_date}")
+        
+        # Submit cause list request
+        url = f"{BASE_URL}?p=cause_list/submitCauseList"
+        
+        form_data = {
+            'CL_court_no': court_name_code,
+            'causelist_date': formatted_date,
+            'cause_list_captcha_code': captcha_text,
+            'court_name_txt': '',
+            'state_code': state_code,
+            'dist_code': dist_code,
+            'court_complex_code': court_code,
+            'est_code': 'null',
+            'cicri': 'civ',
+            'selprevdays': '0',
+            'ajax_req': 'true',
+            'app_token': 'e8fe4f2cc4cc9baaff51327f63192ae727c66ba541b868164d2763b70dc37489'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest',
+            'Referer': f'{BASE_URL}?p=cause_list/'
+        }
+        
+        print(f"Sending POST request to: {url}")
+        response = session.post(url, data=form_data, headers=headers)
+        print(f"Response status: {response.status_code}")
+        print(f"Response content type: {response.headers.get('content-type', 'unknown')}")
+        
+        # Debug: Print first 200 characters of response
+        response_preview = response.text[:200]
+        print(f"Response preview: {response_preview}")
+        
+        # Handle the response - it's JSON with HTML embedded in case_data field
+        html_content = ""
+        
+        # First, try to clean the response text
+        cleaned_response = response.text.strip()
+        
+        # Check if it looks like JSON (starts with { and ends with })
+        if cleaned_response.startswith('{') and cleaned_response.endswith('}'):
+            print("Response appears to be JSON format")
+            try:
+                # Parse as JSON
+                json_response = json.loads(cleaned_response)
+                print("Successfully parsed as JSON")
+                print(f"JSON keys: {list(json_response.keys())}")
+                
+                # Extract the HTML from case_data field
+                if 'case_data' in json_response and json_response['case_data']:
+                    html_content = json_response['case_data']
+                    print("Extracted HTML from case_data field")
+                else:
+                    print("No case_data found in JSON response")
+                    return jsonify({'error': 'No case data in server response'}), 400
+                    
+            except json.JSONDecodeError as e:
+                print(f"JSON parsing failed: {e}")
+                print("Trying to extract JSON manually...")
+                
+                # Try to extract JSON manually using regex
+                import re
+                json_match = re.search(r'\{.*\}', cleaned_response, re.DOTALL)
+                if json_match:
+                    try:
+                        json_str = json_match.group(0)
+                        json_response = json.loads(json_str)
+                        if 'case_data' in json_response:
+                            html_content = json_response['case_data']
+                            print("Extracted HTML using regex")
+                    except:
+                        print("Manual JSON extraction also failed")
+                        html_content = cleaned_response
+                else:
+                    html_content = cleaned_response
+        else:
+            print("Response does not appear to be JSON, treating as HTML")
+            html_content = cleaned_response
+        
+        # If we still don't have HTML content, return error
+        if not html_content:
+            return jsonify({'error': 'Could not extract HTML content from response'}), 400
+        
+        print(f"HTML content length: {len(html_content)}")
+        
+        # Clean and parse the HTML
+        cleaned_html = html_content.replace('\/', '/')
+        soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+        # Look for the cause list table
+        cause_list_table = soup.find('table', {'id': 'dispTable'})
+        
+        if not cause_list_table:
+            print("WARNING: No dispTable found in response")
+            # Try to find any table
+            all_tables = soup.find_all('table')
+            print(f"Found {len(all_tables)} tables total")
+            
+            if len(all_tables) > 0:
+                print("Using first table found")
+                cause_list_table = all_tables[0]
+            else:
+                # Save the HTML for debugging
+                with open('debug_html.html', 'w', encoding='utf-8') as f:
+                    f.write(cleaned_html)
+                print("Saved HTML to debug_html.html for inspection")
+                return jsonify({'error': 'No case data table found in server response'}), 400
+        
+        print(f"Found table with {len(cause_list_table.find_all('tr'))} rows")
+        
+        cause_list = []
+        rows = cause_list_table.find_all('tr')
+        current_case_type = ""
+        
+        for i, row in enumerate(rows):
+            # Skip header rows (they contain <th> tags)
+            if row.find('th'):
+                continue
+            
+            # Check for case type header (colspan='6' with blue color)
+            case_type_td = row.find('td', {'colspan': '6'})
+            if case_type_td:
+                style = case_type_td.get('style', '')
+                if 'color:#3880d4' in style:
+                    current_case_type = case_type_td.get_text(strip=True)
+                    print(f"Found case type: {current_case_type}")
+                    continue
+            
+            # Skip the case_type_lable row
+            if row.find('td', {'id': 'case_type_lable'}):
+                continue
+            
+            # Process data rows - they should have 4 columns
+            cols = row.find_all('td')
+            
+            if len(cols) == 4:
+                sr_no_text = cols[0].get_text(strip=True)
+                
+                if sr_no_text and sr_no_text.isdigit():
+                    # Extract case details from second column
+                    case_cell = cols[1]
+                    # Remove the "View" link but keep the case number
+                    for a_tag in case_cell.find_all('a'):
+                        a_tag.decompose()
+                    case_details = case_cell.get_text(separator='\n', strip=True)
+                    
+                    # Extract party names from third column
+                    party_cell = cols[2]
+                    party_names = party_cell.get_text(separator='\n', strip=True)
+                    
+                    # Extract advocate names from fourth column
+                    advocate_cell = cols[3]
+                    advocate_names = advocate_cell.get_text(separator='\n', strip=True)
+                    
+                    cause_list.append({
+                        'sr_no': int(sr_no_text),
+                        'case_type': current_case_type,
+                        'case_details': case_details,
+                        'party_name': party_names,
+                        'advocate': advocate_names
+                    })
+        
+        print(f"=== PARSING COMPLETE ===")
+        print(f"Extracted {len(cause_list)} cases")
+        
+        if len(cause_list) == 0:
+            # Check if there are any tables with data
+            if len(rows) <= 2:
+                return jsonify({'cause_list': [], 'message': 'No cases listed for the selected date and court'})
+            else:
+                # Save the table HTML for debugging
+                with open('debug_table.html', 'w', encoding='utf-8') as f:
+                    f.write(str(cause_list_table))
+                print("Saved table HTML to debug_table.html for inspection")
+                return jsonify({'error': 'Could not parse case data from table. Table structure may have changed.'}), 400
+        
+        return jsonify({'cause_list': cause_list})
+    
+    except Exception as e:
+        print(f"Error in get_cause_list: {str(e)}")
+        import traceback
+        print(f"Traceback: {traceback.format_exc()}")
+        return jsonify({'error': f'Internal server error: {str(e)}'}), 500
+
+
+
+
+
+
+
+
+@app.route('/api/debug-request', methods=['POST'])
+def debug_request():
+    """Debug endpoint to test the exact request"""
+    try:
+        # Use the same parameters as get_cause_list
+        session_id = request.json.get('session_id')
+        state_code = request.json.get('state_code')
+        dist_code = request.json.get('dist_code')
+        court_code = request.json.get('court_code')
+        court_name_code = request.json.get('court_name_code')
+        date = request.json.get('date')
+        captcha_text = request.json.get('captcha')
+        
+        # Create a session
+        session = requests.Session()
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        })
+        
+        # Convert date
+        date_parts = date.split('-')
+        formatted_date = f"{date_parts[2]}-{date_parts[1]}-{date_parts[0]}"
+        
+        url = f"{BASE_URL}?p=cause_list/submitCauseList"
+        form_data = {
+            'CL_court_no': court_name_code,
+            'causelist_date': formatted_date,
+            'cause_list_captcha_code': captcha_text,
+            'court_name_txt': '',
+            'state_code': state_code,
+            'dist_code': dist_code,
+            'court_complex_code': court_code,
+            'est_code': 'null',
+            'cicri': 'civ',
+            'selprevdays': '0',
+            'ajax_req': 'true',
+            'app_token': 'e8fe4f2cc4cc9baaff51327f63192ae727c66ba541b868164d2763b70dc37489'
+        }
+        
+        response = session.post(url, data=form_data)
+        
+        return jsonify({
+            'status_code': response.status_code,
+            'response_preview': response.text[:1000],
+            'response_length': len(response.text),
+            'url': url,
+            'form_data': form_data
+        })
+        
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
+    
+# ... (Keep all your other existing routes: get_states, get_districts, get_courts, get_court_names)
+
+if __name__ == '__main__':
+    app.run(debug=True)

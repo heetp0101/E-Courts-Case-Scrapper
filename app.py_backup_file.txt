@@ -1,0 +1,227 @@
+# app.py
+from flask import Flask, request, jsonify, render_template
+import requests
+from bs4 import BeautifulSoup
+import json
+
+app = Flask(__name__)
+
+# Base URL for the eCourts service
+BASE_URL = "https://services.ecourts.gov.in/ecourtindia_v6/"
+
+@app.route('/')
+def index():
+    return render_template('index.html')
+
+# Get States
+@app.route('/api/states', methods=['GET'])
+def get_states():
+    try:
+        # Get the main cause list page
+        response = requests.get(f"{BASE_URL}?p=cause_list/")
+        
+        # Check if request was successful
+        if response.status_code != 200:
+            return jsonify({'error': f'Failed to fetch data. Status code: {response.status_code}'}), 500
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Find the state dropdown using the exact ID from the HTML snippet
+        state_select = soup.find('select', {'id': 'sess_state_code'})
+        
+        states = []
+        if state_select:
+            print(f"Found state dropdown with {len(state_select.find_all('option'))} options")
+            for option in state_select.find_all('option'):
+                value = option.get('value')
+                text = option.text.strip()
+                # Skip the placeholder option (value '0')
+                if value and value != '0' and text and text.lower() != 'select state':
+                    states.append({
+                        'code': value,
+                        'name': text
+                    })
+            print(f"Extracted {len(states)} states")
+        else:
+            print("State dropdown not found with id 'sess_state_code'")
+        
+        return jsonify({'states': states})
+    
+    except Exception as e:
+        print(f"Error in get_states: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+# Get Districts based on State
+# Get Districts based on State
+@app.route('/api/districts', methods=['POST'])
+def get_districts():
+    try:
+        state_code = request.json.get('state_code')
+        print(f"Fetching districts for state code: {state_code}")
+        
+        # Use the exact endpoint and form data structure you discovered
+        url = f"{BASE_URL}?p=casestatus/fillDistrict"
+        
+        form_data = {
+            'state_code': state_code,
+            'ajax_req': 'true',
+            'app_token': '6d0d7af522b4a85486f5f22ff972dbb2beb8a3221744493f406deeda3dda8372'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        response = requests.post(url, data=form_data, headers=headers)
+        print(f"District API response status: {response.status_code}")
+        print(f"Raw response text: {response.text[:500]}...")  # Print first 500 chars for debugging
+        
+        # Fix the escaped HTML tags before parsing
+        cleaned_html = response.text.replace('<\/', '</')
+        
+        # Parse the cleaned HTML
+        soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+        # Extract district options
+        districts = []
+        option_elements = soup.find_all('option')
+        
+        for option in option_elements:
+            value = option.get('value')
+            text = option.get_text(strip=True)
+            
+            # Skip the placeholder option and empty values
+            if value and value != '' and text and text.lower() != 'select district':
+                districts.append({
+                    'code': value,
+                    'name': text
+                })
+        
+        print(f"Extracted {len(districts)} districts: {[d['name'] for d in districts]}")
+        return jsonify({'districts': districts})
+    
+    except Exception as e:
+        print(f"Error in get_districts: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+# Get Courts based on District
+@app.route('/api/courts', methods=['POST'])
+def get_courts():
+    try:
+        state_code = request.json.get('state_code')
+        dist_code = request.json.get('dist_code')
+        print(f"Fetching courts for state: {state_code}, district: {dist_code}")
+        
+        # Use the correct endpoint for courts
+        url = f"{BASE_URL}?p=casestatus/fillcomplex"
+        
+        form_data = {
+            'state_code': state_code,
+            'dist_code': dist_code,  # Note: using 'district_code' instead of 'dist_code'
+            'ajax_req': 'true',
+            'app_token': '2f4d7e7c37a9de46f436d02027e20e098961ed84de12b1b93fabdb6398a34e7a'  # Using the new app_token you provided
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        response = requests.post(url, data=form_data, headers=headers)
+        print(f"Court API response status: {response.status_code}")
+        print(f"Raw court response: {response.text[:500]}...")
+        
+        # Fix the escaped HTML tags before parsing
+        cleaned_html = response.text.replace('<\/', '</')
+        
+        # Parse the cleaned HTML
+        soup = BeautifulSoup(cleaned_html, 'html.parser')
+        
+        # Extract court options
+        courts = []
+        option_elements = soup.find_all('option')
+        
+        for option in option_elements:
+            value = option.get('value')
+            text = option.get_text(strip=True)
+            
+            # Skip the placeholder option and empty values
+            if value and value != '' and text and text.lower() != 'select court' and text.strip():
+                courts.append({
+                    'code': value,
+                    'name': text
+                })
+        
+        print(f"Extracted {len(courts)} courts: {[c['name'] for c in courts]}")
+        return jsonify({'courts': courts})
+    
+    except Exception as e:
+        print(f"Error in get_courts: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+
+
+# Get Cause List
+@app.route('/api/cause-list', methods=['POST'])
+def get_cause_list():
+    try:
+        state_code = request.json.get('state_code')
+        dist_code = request.json.get('dist_code')
+        court_code = request.json.get('court_code')
+        date = request.json.get('date')
+        
+        print(f"Fetching cause list for state: {state_code}, district: {dist_code}, court: {court_code}, date: {date}")
+        
+        # Use the correct endpoint for cause list
+        url = f"{BASE_URL}?p=cause_list/cause_list_ajax"
+        
+        form_data = {
+            'state_code': state_code,
+            'dist_code': dist_code,
+            'court_code': court_code,
+            'case_date': date,
+            'ajax_req': 'true',
+            'app_token': '6d0d7af522b4a85486f5f22ff972dbb2beb8a3221744493f406deeda3dda8372'
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Content-Type': 'application/x-www-form-urlencoded',
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        response = requests.post(url, data=form_data, headers=headers)
+        print(f"Cause list API response status: {response.status_code}")
+        
+        # Parse the cause list response
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Parse the cause list table
+        cause_list_table = soup.find('table')
+        
+        cause_list = []
+        if cause_list_table:
+            rows = cause_list_table.find_all('tr')
+            for i, row in enumerate(rows):
+                cols = row.find_all('td')
+                if len(cols) >= 4:
+                    cause_list.append({
+                        'sr_no': cols[0].text.strip() if len(cols) > 0 else f"{i}",
+                        'case_no': cols[1].text.strip() if len(cols) > 1 else '',
+                        'parties': cols[2].text.strip() if len(cols) > 2 else '',
+                        'purpose': cols[3].text.strip() if len(cols) > 3 else ''
+                    })
+        
+        print(f"Extracted {len(cause_list)} cases")
+        return jsonify({'cause_list': cause_list})
+    
+    except Exception as e:
+        print(f"Error in get_cause_list: {str(e)}")
+        return jsonify({'error': str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(debug=True)
