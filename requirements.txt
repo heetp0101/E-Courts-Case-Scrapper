@@ -4,5 +4,5 @@ beautifulsoup4
 numpy
 pandas
 pillow
-pytesseract==0.3.10
+pytesseract
 lxml
