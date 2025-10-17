@@ -1,4 +1,4 @@
-# Instruction to run the Project 
+# Instructions for the E-Courts Case Scrapper  Project 
 - Follow the below steps to set up and run the project
 
 
